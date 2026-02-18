@@ -330,6 +330,11 @@ enum P2PCommand {
         chunk_hashes: Vec<String>,
         response_tx: tokio::sync::oneshot::Sender<usize>, // Returns count of peers notified
     },
+    SyncDeletes {
+        target_peer: PeerId,
+        file_id: String,
+        chunk_hashes: Vec<String>,
+    },
 }
 
 /// Global P2P node instance
@@ -411,12 +416,13 @@ impl P2PNode {
                     request_response::Config::default(),
                 );
 
-             let chunk_store = request_response::Behaviour::new(
-    [(StreamProtocol::new("/meshdrive/chunk-store/1.0.0"), ProtocolSupport::Full)],
-    request_response::Config::default()
-        .with_request_timeout(Duration::from_secs(120)),
-);
-
+                // Chunk store protocol - use longer timeout for large transfers
+                let mut store_config = request_response::Config::default();
+                store_config.set_request_timeout(Duration::from_secs(120));
+                let chunk_store = request_response::Behaviour::new(
+                    [(StreamProtocol::new("/meshdrive/chunk-store/1.0.0"), ProtocolSupport::Full)],
+                    store_config,
+                );
 
                 // File delete protocol
                 let file_delete = request_response::Behaviour::new(
@@ -520,6 +526,34 @@ impl P2PNode {
                             node.connected_peers.write().await.insert(peer_id);
                             // ✅ Emit event
                             let _ = node.app_handle.emit("peer-connected", peer_id.to_string());
+                            
+                            // ✅ NEW: Sync pending deletes to this peer
+                            let peer_id_clone = peer_id;
+                            let swarm_cmd_tx = node.command_tx.clone();
+                            
+                            tokio::spawn(async move {
+                                if let Ok(pending) = crate::chunking::get_pending_deletes() {
+                                    if !pending.is_empty() {
+                                        println!("[P2P] Syncing {} pending deletes to {}", pending.len(), peer_id_clone);
+                                        for item in pending {
+                                            // Send delete command for each pending item
+                                            // We reuse the BroadcastDelete logic but target single peer via command_tx? 
+                                            // Actually BroadcastDelete sends to ALL connected.
+                                            // We need a way to send to ONE peer. 
+                                            // Let's use a new command or just send direct request if we had access to swarm.
+                                            // Since we can't access swarm here directly (we are in spawn), we should add a command 
+                                            // or modify P2PCommand to allow targeting specific peer.
+                                            // For now, let's add a generic 'SendDeleteToPeer' command or similar.
+                                            // ABSTRACTION: let's add `SyncDeletes { peer_id }` to P2PCommand
+                                            let _ = swarm_cmd_tx.send(P2PCommand::SyncDeletes { 
+                                                target_peer: peer_id_clone,
+                                                file_id: item.file_id,
+                                                chunk_hashes: item.chunk_hashes
+                                            }).await;
+                                        }
+                                    }
+                                }
+                            });
                         }
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
                             println!("[P2P] Disconnected from {}", peer_id);
@@ -650,8 +684,8 @@ impl P2PNode {
                                                     }
                                                 } else {
                                                     println!("[P2P] No hashes provided, attempting legacy deletion");
-let res = crate::chunking::delete_local_chunks_only(file_id_bg.clone()).await;
-if let Err(e) = res {
+                                                    let res = crate::chunking::delete_local_chunks_only(file_id_bg.clone());
+                                                    if let Err(e) = res {
                                                         println!("[P2P] Remote deletion failed: {}", e);
                                                     }
                                                 }
@@ -717,6 +751,16 @@ if let Err(e) = res {
                                 );
                             }
                             let _ = response_tx.send(count);
+                        }
+                        P2PCommand::SyncDeletes { target_peer, file_id, chunk_hashes } => {
+                            println!("[P2P] Syncing delete for file {} to {}", file_id, target_peer);
+                            swarm.behaviour_mut().file_delete.send_request(
+                                &target_peer,
+                                DeleteFileRequest { 
+                                    file_id,
+                                    chunk_hashes
+                                }
+                            );
                         }
                     }
                 }
