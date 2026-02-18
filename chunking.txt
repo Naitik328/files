@@ -1,0 +1,857 @@
+use once_cell::sync::OnceCell;
+use serde::{Deserialize, Serialize};
+use blake3;
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
+use tauri::Emitter;
+use tokio::sync::RwLock;
+use uuid::Uuid;
+
+const NUM_CHUNKS: usize = 10;
+
+// ============================================
+// GLOBAL CHUNK INDEX
+// ============================================
+
+/// Global in-memory index: chunk_hash -> PathBuf
+static CHUNK_INDEX: OnceCell<Arc<RwLock<HashMap<String, PathBuf>>>> = OnceCell::new();
+
+fn get_or_init_index() -> &'static Arc<RwLock<HashMap<String, PathBuf>>> {
+    CHUNK_INDEX.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+}
+
+/// Initialize the chunk index by scanning the chunks directory once at startup.
+/// Walks both flat `{hash}.chunk` files and legacy `{file_id}/chunk_XXX` subdirectories.
+pub async fn init_chunk_index(chunks_dir: &PathBuf) {
+    let index = get_or_init_index();
+    let mut map = index.write().await;
+    map.clear();
+
+    let entries = match fs::read_dir(chunks_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            println!("[ChunkIndex] Failed to read chunks dir: {}", e);
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            // Flat hash-named file: {hash}.chunk — no need to compute hash, stem IS the hash
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if path.extension().map_or(false, |ext| ext == "chunk") {
+                    map.insert(stem.to_string(), path);
+                    continue;
+                }
+            }
+
+            // ✅ FIX: Use streaming hash (no full file read into RAM)
+            if let Ok(hash) = calculate_chunk_hash_internal(&path) {
+                map.insert(hash, path);
+            }
+        } else if path.is_dir() {
+            // Legacy subdirectory: {file_id}/chunk_XXX
+            if let Ok(sub_entries) = fs::read_dir(&path) {
+                for sub_entry in sub_entries.flatten() {
+                    let sub_path = sub_entry.path();
+                    if sub_path.is_file() {
+                        // ✅ FIX: Use streaming hash
+                        if let Ok(hash) = calculate_chunk_hash_internal(&sub_path) {
+                            map.insert(hash, sub_path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!("[ChunkIndex] Initialized with {} entries", map.len());
+}
+
+/// ✅ ASYNC ONLY — O(1) lookup
+pub async fn get_chunk_path_by_hash(hash: &str) -> Option<PathBuf> {
+    let index = get_or_init_index();
+    let map = index.read().await;
+    map.get(hash).cloned()
+}
+
+/// Insert a chunk into the index after creation or storage.
+pub async fn insert_chunk_index(hash: String, path: PathBuf) {
+    let index = get_or_init_index();
+    let mut map = index.write().await;
+    map.insert(hash, path);
+}
+
+/// Remove a chunk from the index after deletion.
+pub async fn remove_chunk_index(hash: &str) {
+    let index = get_or_init_index();
+    let mut map = index.write().await;
+    map.remove(hash);
+}
+
+/// Metadata about a chunked file
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChunkedFile {
+    pub id: String,
+    pub original_name: String,
+    pub total_size: u64,
+    pub chunk_count: usize,
+    pub chunk_size: u64,
+    pub chunks_dir: String,
+    #[serde(default)]
+    pub backend_file_id: Option<String>,
+    #[serde(default)]
+    pub folder_id: Option<String>,
+}
+
+// ✅ NEW: Return hashes alongside ChunkedFile so callers don't re-read chunks from disk
+pub struct ChunkedFileWithHashes {
+    pub file: ChunkedFile,
+    pub hashes: Vec<String>,
+}
+
+/// Info about a single chunk
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChunkInfo {
+    pub chunk_index: usize,
+    pub chunk_path: String,
+    pub chunk_size: u64,
+}
+
+/// Metadata about a folder
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Folder {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+}
+
+/// Get the chunks storage directory
+fn get_chunks_dir() -> Result<PathBuf, String> {
+    let data_dir =
+        dirs::data_local_dir().ok_or_else(|| "Could not find local data directory".to_string())?;
+
+    let chunks_dir = data_dir.join("meshdrive").join("chunks");
+
+    if !chunks_dir.exists() {
+        fs::create_dir_all(&chunks_dir)
+            .map_err(|e| format!("Failed to create chunks directory: {}", e))?;
+    }
+
+    Ok(chunks_dir)
+}
+
+/// Get the metadata directory for storing chunk info
+fn get_metadata_dir() -> Result<PathBuf, String> {
+    let data_dir =
+        dirs::data_local_dir().ok_or_else(|| "Could not find local data directory".to_string())?;
+
+    let meta_dir = data_dir.join("meshdrive").join("metadata");
+
+    if !meta_dir.exists() {
+        fs::create_dir_all(&meta_dir)
+            .map_err(|e| format!("Failed to create metadata directory: {}", e))?;
+    }
+
+    Ok(meta_dir)
+}
+
+/// Get the folders metadata directory
+fn get_folders_dir() -> Result<PathBuf, String> {
+    let meta_dir = get_metadata_dir()?;
+    let folders_dir = meta_dir.join("folders");
+
+    if !folders_dir.exists() {
+        fs::create_dir_all(&folders_dir)
+            .map_err(|e| format!("Failed to create folders directory: {}", e))?;
+    }
+
+    Ok(folders_dir)
+}
+
+// ============================================
+// ✅ OPTIMIZED: Calculate hash using streaming (no full file read into RAM)
+// Previously used read_to_end() which loaded entire chunk into memory.
+// Now uses a 64KB fixed buffer loop — much lower RAM usage on large files.
+// ============================================
+pub fn calculate_chunk_hash_internal(chunk_path: &PathBuf) -> Result<String, String> {
+    let mut file = File::open(chunk_path).map_err(|e| format!("Failed to open chunk: {}", e))?;
+
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024]; // 64KB fixed buffer — no heap allocation per chunk
+
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => { hasher.update(&buffer[..n]); },
+            Err(e) => return Err(format!("Failed to read chunk: {}", e)),
+        }
+    }
+
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+// ============================================
+// ✅ OPTIMIZED INTERNAL VERSION: Chunks file AND returns hashes in one pass.
+// This avoids re-reading every chunk from disk a second time in upload_chunk_and_register.
+// Previously: write chunks -> then re-read all chunks just to hash them = 2x disk reads.
+// Now: write chunks + hash in the same loop = 1x disk reads.
+// ============================================
+pub async fn upload_and_chunk_file_with_hashes(
+    source_path: String,
+) -> Result<ChunkedFileWithHashes, String> {
+    let source = PathBuf::from(&source_path);
+
+    if !source.exists() {
+        return Err(format!("Source file does not exist: {}", source_path));
+    }
+
+    let original_name = source
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "Invalid filename".to_string())?
+        .to_string();
+
+    let metadata =
+        fs::metadata(&source).map_err(|e| format!("Failed to get file metadata: {}", e))?;
+    let total_size = metadata.len();
+
+    let file_id = Uuid::new_v4().to_string();
+
+    let chunks_base_dir = get_chunks_dir()?;
+    let file_chunks_dir = chunks_base_dir.join(&file_id);
+    fs::create_dir_all(&file_chunks_dir)
+        .map_err(|e| format!("Failed to create file chunks directory: {}", e))?;
+
+    let chunk_size = (total_size as f64 / NUM_CHUNKS as f64).ceil() as u64;
+
+    let file = File::open(&source).map_err(|e| format!("Failed to open source file: {}", e))?;
+    let mut reader = BufReader::new(file);
+
+    let mut buffer = vec![0u8; chunk_size as usize];
+    let mut chunk_index = 0;
+
+    // ✅ KEY CHANGE: collect hashes here instead of re-reading files later
+    let mut chunk_hashes: Vec<String> = Vec::new();
+
+    loop {
+        let bytes_read = reader
+            .read(&mut buffer)
+            .map_err(|e| format!("Failed to read from source file: {}", e))?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        let chunk_filename = format!("chunk_{:03}", chunk_index);
+        let chunk_path = file_chunks_dir.join(&chunk_filename);
+
+        let chunk_file =
+            File::create(&chunk_path).map_err(|e| format!("Failed to create chunk file: {}", e))?;
+        let mut writer = BufWriter::new(chunk_file);
+
+        writer
+            .write_all(&buffer[..bytes_read])
+            .map_err(|e| format!("Failed to write chunk: {}", e))?;
+
+        // ✅ Hash computed HERE while data is already in memory — no extra disk read needed
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&buffer[..bytes_read]);
+        let hash = hasher.finalize().to_hex().to_string();
+
+        // Insert into index and collect hash
+        insert_chunk_index(hash.clone(), chunk_path).await;
+        chunk_hashes.push(hash);
+
+        chunk_index += 1;
+    }
+
+    let chunked_file = ChunkedFile {
+        id: file_id.clone(),
+        original_name,
+        total_size,
+        chunk_count: chunk_index,
+        chunk_size,
+        chunks_dir: file_chunks_dir.to_string_lossy().to_string(),
+        backend_file_id: None,
+        folder_id: None,
+    };
+
+    let metadata_dir = get_metadata_dir()?;
+    let metadata_path = metadata_dir.join(format!("{}.json", file_id));
+    let metadata_json = serde_json::to_string_pretty(&chunked_file)
+        .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
+
+    fs::write(&metadata_path, metadata_json)
+        .map_err(|e| format!("Failed to write metadata: {}", e))?;
+
+    Ok(ChunkedFileWithHashes {
+        file: chunked_file,
+        hashes: chunk_hashes,
+    })
+}
+
+/// Upload and chunk a file into NUM_CHUNKS pieces (Tauri command wrapper)
+#[tauri::command]
+pub async fn upload_and_chunk_file(source_path: String) -> Result<ChunkedFile, String> {
+    // Reuse the optimized version, just discard hashes
+    let result = upload_and_chunk_file_with_hashes(source_path).await?;
+    Ok(result.file)
+}
+
+/// List all chunked files
+#[tauri::command]
+pub async fn list_chunked_files() -> Result<Vec<ChunkedFile>, String> {
+    let metadata_dir = get_metadata_dir()?;
+    let mut files = Vec::new();
+
+    let entries = fs::read_dir(&metadata_dir)
+        .map_err(|e| format!("Failed to read metadata directory: {}", e))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+        let path = entry.path();
+
+        if path.extension().map_or(false, |ext| ext == "json") {
+            let content = fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read metadata file: {}", e))?;
+
+            let chunked_file: ChunkedFile = serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse metadata: {}", e))?;
+
+            files.push(chunked_file);
+        }
+    }
+
+    Ok(files)
+}
+
+/// Get chunks info for a specific file
+#[tauri::command]
+pub async fn get_file_chunks(file_id: String) -> Result<Vec<ChunkInfo>, String> {
+    let metadata_dir = get_metadata_dir()?;
+    let metadata_path = metadata_dir.join(format!("{}.json", file_id));
+
+    let content = fs::read_to_string(&metadata_path)
+        .map_err(|e| format!("Failed to read metadata: {}", e))?;
+
+    let chunked_file: ChunkedFile =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse metadata: {}", e))?;
+
+    let chunks_dir = PathBuf::from(&chunked_file.chunks_dir);
+    let mut chunks = Vec::new();
+
+    for i in 0..chunked_file.chunk_count {
+        let chunk_filename = format!("chunk_{:03}", i);
+        let chunk_path = chunks_dir.join(&chunk_filename);
+
+        let chunk_metadata = fs::metadata(&chunk_path)
+            .map_err(|e| format!("Failed to get chunk metadata: {}", e))?;
+
+        chunks.push(ChunkInfo {
+            chunk_index: i,
+            chunk_path: chunk_path.to_string_lossy().to_string(),
+            chunk_size: chunk_metadata.len(),
+        });
+    }
+
+    Ok(chunks)
+}
+
+/// Merge chunks back into original file and save to specified location
+#[tauri::command]
+pub async fn download_and_merge_file(
+    file_id: String,
+    destination_path: String,
+) -> Result<String, String> {
+    let metadata_dir = get_metadata_dir()?;
+    let metadata_path = metadata_dir.join(format!("{}.json", file_id));
+
+    let content = fs::read_to_string(&metadata_path)
+        .map_err(|e| format!("Failed to read metadata: {}", e))?;
+
+    let chunked_file: ChunkedFile =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse metadata: {}", e))?;
+
+    let chunks_dir = PathBuf::from(&chunked_file.chunks_dir);
+
+    let output_path = if destination_path.is_empty() {
+        let downloads =
+            dirs::download_dir().ok_or_else(|| "Could not find downloads directory".to_string())?;
+        downloads.join(&chunked_file.original_name)
+    } else {
+        PathBuf::from(&destination_path).join(&chunked_file.original_name)
+    };
+
+    let output_file =
+        File::create(&output_path).map_err(|e| format!("Failed to create output file: {}", e))?;
+    let mut writer = BufWriter::new(output_file);
+
+    // ✅ Use streaming copy instead of read_to_end per chunk — avoids loading full chunk into RAM
+    for i in 0..chunked_file.chunk_count {
+        let chunk_filename = format!("chunk_{:03}", i);
+        let chunk_path = chunks_dir.join(&chunk_filename);
+
+        let chunk_file =
+            File::open(&chunk_path).map_err(|e| format!("Failed to open chunk {}: {}", i, e))?;
+        let mut reader = BufReader::new(chunk_file);
+
+        std::io::copy(&mut reader, &mut writer)
+            .map_err(|e| format!("Failed to copy chunk {}: {}", i, e))?;
+    }
+
+    writer
+        .flush()
+        .map_err(|e| format!("Failed to flush output file: {}", e))?;
+
+    Ok(output_path.to_string_lossy().to_string())
+}
+
+// ============================================
+// ✅ FIX: delete_local_chunks_only is now async to properly await index removals.
+// Previously it used tokio::spawn (fire-and-forget) which caused a race condition:
+// the HashMap entries might not be removed before the files were deleted,
+// leaving stale entries in the index pointing to deleted files.
+// ============================================
+pub async fn delete_local_chunks_only(file_id: String) -> Result<(), String> {
+    let metadata_dir = get_metadata_dir()?;
+    let metadata_path = metadata_dir.join(format!("{}.json", file_id));
+
+    if !metadata_path.exists() {
+        let chunks_base_dir = get_chunks_dir()?;
+        let potential_chunks_dir = chunks_base_dir.join(&file_id);
+
+        if potential_chunks_dir.exists() {
+            // ✅ FIX: await each removal directly instead of spawning
+            if let Ok(entries) = fs::read_dir(&potential_chunks_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Ok(hash) = calculate_chunk_hash_internal(&path) {
+                            remove_chunk_index(&hash).await; // ✅ awaited
+                        }
+                    }
+                }
+            }
+
+            fs::remove_dir_all(&potential_chunks_dir)
+                .map_err(|e| format!("Failed to delete orphan chunks: {}", e))?;
+        }
+
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&metadata_path)
+        .map_err(|e| format!("Failed to read metadata: {}", e))?;
+
+    let chunked_file: ChunkedFile =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse metadata: {}", e))?;
+
+    let chunks_dir = PathBuf::from(&chunked_file.chunks_dir);
+
+    if chunks_dir.exists() {
+        // ✅ FIX: await each removal directly instead of spawning
+        if let Ok(entries) = fs::read_dir(&chunks_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Ok(hash) = calculate_chunk_hash_internal(&path) {
+                        remove_chunk_index(&hash).await; // ✅ awaited
+                    }
+                }
+            }
+        }
+
+        fs::remove_dir_all(&chunks_dir).map_err(|e| format!("Failed to delete chunks: {}", e))?;
+    }
+
+    fs::remove_file(&metadata_path).map_err(|e| format!("Failed to delete metadata: {}", e))?;
+
+    Ok(())
+}
+
+/// Delete a chunked file and all its chunks (Local + Backend + P2P)
+#[tauri::command]
+pub async fn delete_chunked_file(file_id: String, _app: tauri::AppHandle) -> Result<(), String> {
+    println!("[Delete] Starting deletion for file: {}", file_id);
+
+    let metadata_dir = get_metadata_dir()?;
+    let metadata_path = metadata_dir.join(format!("{}.json", file_id));
+
+    let backend_file_id = if metadata_path.exists() {
+        match fs::read_to_string(&metadata_path) {
+            Ok(content) => match serde_json::from_str::<ChunkedFile>(&content) {
+                Ok(meta) => meta.backend_file_id,
+                Err(_) => None,
+            },
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let mut all_chunk_hashes = Vec::new();
+    let mut token = String::new();
+
+    if let Some(bid) = &backend_file_id {
+        if let Ok(auth_state) = crate::auth::load_auth_state() {
+            token = auth_state.token.clone();
+            if !token.is_empty() {
+                let api = crate::api_client::ApiClient::new();
+                println!("[Delete] Fetching full chunk list from backend...");
+                match api.get_file_download_info(&token, bid).await {
+                    Ok(info) => {
+                        all_chunk_hashes = info
+                            .chunks
+                            .iter()
+                            .map(|c| c.chunk.chunk_hash.clone())
+                            .collect();
+                        println!(
+                            "[Delete] ✓ Retrieved {} hashes from backend",
+                            all_chunk_hashes.len()
+                        );
+                    }
+                    Err(e) => {
+                        println!("[Delete] Failed to fetch info from backend: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: stream-hash local files (no full file read into RAM)
+    if all_chunk_hashes.is_empty() && metadata_path.exists() {
+        println!("[Delete] Fallback: Calculating hashes from local files...");
+        if let Ok(content) = fs::read_to_string(&metadata_path) {
+            if let Ok(meta) = serde_json::from_str::<ChunkedFile>(&content) {
+                let chunks_dir = PathBuf::from(&meta.chunks_dir);
+                for i in 0..meta.chunk_count {
+                    let chunk_filename = format!("chunk_{:03}", i);
+                    let chunk_path = chunks_dir.join(&chunk_filename);
+                    if let Ok(mut file) = File::open(&chunk_path) {
+                        let mut hasher = blake3::Hasher::new();
+                        let mut buffer = [0u8; 64 * 1024];
+                        loop {
+                            match file.read(&mut buffer) {
+                                Ok(0) => break,
+                                Ok(n) => { hasher.update(&buffer[..n]); },
+                                Err(_) => break,
+                            }
+                        }
+                        all_chunk_hashes.push(hasher.finalize().to_hex().to_string());
+                    }
+                }
+            }
+        }
+        println!("[Delete] ✓ Calculated {} hashes locally", all_chunk_hashes.len());
+    }
+
+    if let Some(bid) = &backend_file_id {
+        println!("[Delete] Removing from backend: {}", bid);
+        if !token.is_empty() {
+            let api = crate::api_client::ApiClient::new();
+            if let Err(e) = api.delete_file(&token, bid).await {
+                println!("[Delete] Warning: Failed to delete from backend: {}", e);
+            } else {
+                println!("[Delete] ✓ Removed from backend");
+            }
+        }
+    }
+
+    if let Some(node) = crate::p2p::get_p2p_node() {
+        if !all_chunk_hashes.is_empty() {
+            println!(
+                "[Delete] Broadcasting delete to peers with {} hashes...",
+                all_chunk_hashes.len()
+            );
+            let count = node
+                .broadcast_delete(file_id.clone(), all_chunk_hashes)
+                .await;
+            println!("[Delete] ✓ Notified {} peers", count);
+        } else {
+            println!("[Delete] Warning: No hashes found/calculated, skipping peer broadcast");
+        }
+    }
+
+    println!("[Delete] Removing local data...");
+    delete_local_chunks_only(file_id).await?; // ✅ now properly awaited
+    println!("[Delete] ✓ Local data removed");
+
+    Ok(())
+}
+
+/// Get the chunks directory path
+#[tauri::command]
+pub fn get_chunks_directory() -> Result<String, String> {
+    let chunks_dir = get_chunks_dir()?;
+    Ok(chunks_dir.to_string_lossy().to_string())
+}
+
+/// Upload, chunk, and register with progress events
+/// ✅ OPTIMIZED: Uses upload_and_chunk_file_with_hashes — chunks are hashed once while writing,
+/// so Step 2 (hash calculation) no longer re-reads every chunk file from disk.
+#[tauri::command]
+pub async fn upload_chunk_and_register(
+    source_path: String,
+    folder_id: Option<String>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    println!("[Upload] Starting complete upload flow...");
+
+    let emit_progress = |stage: &str, progress: u8| {
+        let _ = app.emit(
+            "upload-progress",
+            serde_json::json!({
+                "stage": stage,
+                "progress": progress
+            }),
+        );
+    };
+
+    // Step 1+2 combined: Chunk the file AND collect hashes in one pass
+    emit_progress("Chunking file...", 10);
+    println!("[Upload] Step 1/4: Chunking file and computing hashes...");
+
+    // ✅ KEY CHANGE: hashes come back from chunking — no second disk read pass needed
+    let ChunkedFileWithHashes { file: chunked_file, hashes: chunk_hashes } =
+        upload_and_chunk_file_with_hashes(source_path.clone()).await?;
+
+    println!(
+        "[Upload] ✓ Created {} chunks with hashes in one pass",
+        chunked_file.chunk_count
+    );
+    emit_progress("Chunking and hashing complete", 40);
+
+    // Step 2: Upload file metadata to backend
+    emit_progress("Registering with backend...", 45);
+    println!("[Upload] Step 2/4: Registering file with backend...");
+    let uploaded =
+        crate::upload::upload_file_with_backend(source_path, chunked_file.chunk_count as i32)
+            .await?;
+
+    let backend_file_id = uploaded
+        .backend_file_id
+        .ok_or_else(|| "Failed to get backend file ID".to_string())?;
+
+    println!("[Upload] ✓ File registered: {}", backend_file_id);
+    emit_progress("Backend registration complete", 60);
+
+    // Step 3: Register chunks with backend
+    emit_progress("Registering chunks...", 65);
+    println!("[Upload] Step 3/4: Registering chunks with backend...");
+    let _chunk_ids = crate::upload::register_chunks_with_backend(
+        backend_file_id.clone(),
+        chunk_hashes.clone(),
+        chunked_file.chunk_size as i32,
+    )
+    .await?;
+    println!("[Upload] ✓ Chunks registered");
+    emit_progress("Chunks registered", 75);
+
+    // Step 4: Save backend_file_id to local metadata
+    emit_progress("Updating metadata...", 80);
+    let metadata_dir = get_metadata_dir()?;
+    let metadata_path = metadata_dir.join(format!("{}.json", chunked_file.id));
+    let mut updated_meta = chunked_file.clone();
+    updated_meta.backend_file_id = Some(backend_file_id.clone());
+    updated_meta.folder_id = folder_id;
+    let metadata_json = serde_json::to_string_pretty(&updated_meta)
+        .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
+    fs::write(&metadata_path, metadata_json)
+        .map_err(|e| format!("Failed to update metadata: {}", e))?;
+    emit_progress("Metadata updated", 85);
+
+    // Step 5: AUTO-DISTRIBUTE chunks to peers
+    emit_progress("Distributing to peers...", 90);
+    println!("[Upload] Step 4/4: Distributing chunks to peers...");
+    match crate::download::distribute_chunks_to_peers(
+        chunked_file.id.clone(),
+        backend_file_id.clone(),
+    )
+    .await
+    {
+        Ok(result) => {
+            println!("[Upload] ✓ Distribution complete!");
+            println!("[Upload]   - Chunks distributed: {}", result.chunks_distributed);
+            println!("[Upload]   - Peers available: {}", result.peers_reached);
+            if !result.errors.is_empty() {
+                println!("[Upload]   - Warnings: {:?}", result.errors);
+            }
+            emit_progress("Distribution complete", 95);
+        }
+        Err(e) => {
+            println!("[Upload] ⚠ Distribution warning: {}", e);
+            emit_progress("Distribution warning", 95);
+        }
+    }
+
+    emit_progress("Upload complete!", 100);
+    println!("[Upload] ✅ Upload complete! File ID: {}", backend_file_id);
+
+    Ok(backend_file_id)
+}
+
+// ============================================
+// FOLDER MANAGEMENT COMMANDS
+// ============================================
+
+/// Create a new folder
+#[tauri::command]
+pub async fn create_folder(name: String) -> Result<Folder, String> {
+    let folder_id = Uuid::new_v4().to_string();
+    let now = chrono::Local::now().to_rfc3339();
+
+    let folder = Folder {
+        id: folder_id.clone(),
+        name,
+        created_at: now,
+    };
+
+    let folders_dir = get_folders_dir()?;
+    let folder_path = folders_dir.join(format!("{}.json", folder_id));
+    let json = serde_json::to_string_pretty(&folder)
+        .map_err(|e| format!("Failed to serialize folder: {}", e))?;
+    fs::write(&folder_path, json)
+        .map_err(|e| format!("Failed to write folder metadata: {}", e))?;
+
+    println!("[Folders] ✓ Created folder: {} ({})", folder.name, folder.id);
+    Ok(folder)
+}
+
+/// List all folders
+#[tauri::command]
+pub async fn list_folders() -> Result<Vec<Folder>, String> {
+    let folders_dir = get_folders_dir()?;
+    let mut folders = Vec::new();
+
+    let entries = fs::read_dir(&folders_dir)
+        .map_err(|e| format!("Failed to read folders directory: {}", e))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+        let path = entry.path();
+
+        if path.extension().map_or(false, |ext| ext == "json") {
+            let content = fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read folder file: {}", e))?;
+            if let Ok(folder) = serde_json::from_str::<Folder>(&content) {
+                folders.push(folder);
+            }
+        }
+    }
+
+    folders.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    Ok(folders)
+}
+
+/// Rename a folder
+#[tauri::command]
+pub async fn rename_folder(folder_id: String, new_name: String) -> Result<Folder, String> {
+    let folders_dir = get_folders_dir()?;
+    let folder_path = folders_dir.join(format!("{}.json", folder_id));
+
+    if !folder_path.exists() {
+        return Err(format!("Folder not found: {}", folder_id));
+    }
+
+    let content = fs::read_to_string(&folder_path)
+        .map_err(|e| format!("Failed to read folder: {}", e))?;
+    let mut folder: Folder = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse folder: {}", e))?;
+
+    folder.name = new_name.clone();
+
+    let json = serde_json::to_string_pretty(&folder)
+        .map_err(|e| format!("Failed to serialize folder: {}", e))?;
+    fs::write(&folder_path, json)
+        .map_err(|e| format!("Failed to write folder: {}", e))?;
+
+    println!("[Folders] ✓ Renamed folder {} to '{}'", folder_id, new_name);
+    Ok(folder)
+}
+
+/// Delete a folder (files inside are moved back to root)
+#[tauri::command]
+pub async fn delete_folder(folder_id: String) -> Result<(), String> {
+    let metadata_dir = get_metadata_dir()?;
+    let entries = fs::read_dir(&metadata_dir)
+        .map_err(|e| format!("Failed to read metadata dir: {}", e))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+        let path = entry.path();
+
+        if path.extension().map_or(false, |ext| ext == "json") {
+            let content = fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read file: {}", e))?;
+            if let Ok(mut file_meta) = serde_json::from_str::<ChunkedFile>(&content) {
+                if file_meta.folder_id.as_deref() == Some(&folder_id) {
+                    file_meta.folder_id = None;
+                    let json = serde_json::to_string_pretty(&file_meta)
+                        .map_err(|e| format!("Failed to serialize: {}", e))?;
+                    fs::write(&path, json)
+                        .map_err(|e| format!("Failed to write: {}", e))?;
+                }
+            }
+        }
+    }
+
+    let folders_dir = get_folders_dir()?;
+    let folder_path = folders_dir.join(format!("{}.json", folder_id));
+    if folder_path.exists() {
+        fs::remove_file(&folder_path)
+            .map_err(|e| format!("Failed to delete folder: {}", e))?;
+    }
+
+    println!("[Folders] ✓ Deleted folder: {}", folder_id);
+    Ok(())
+}
+
+/// Move a file into a folder (or back to root if folder_id is None)
+#[tauri::command]
+pub async fn move_file_to_folder(file_id: String, folder_id: Option<String>) -> Result<(), String> {
+    let metadata_dir = get_metadata_dir()?;
+    let metadata_path = metadata_dir.join(format!("{}.json", file_id));
+
+    if !metadata_path.exists() {
+        return Err(format!("File not found: {}", file_id));
+    }
+
+    if let Some(ref fid) = folder_id {
+        let folders_dir = get_folders_dir()?;
+        let folder_path = folders_dir.join(format!("{}.json", fid));
+        if !folder_path.exists() {
+            return Err(format!("Folder not found: {}", fid));
+        }
+    }
+
+    let content = fs::read_to_string(&metadata_path)
+        .map_err(|e| format!("Failed to read file metadata: {}", e))?;
+    let mut file_meta: ChunkedFile = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse metadata: {}", e))?;
+
+    file_meta.folder_id = folder_id.clone();
+
+    let json = serde_json::to_string_pretty(&file_meta)
+        .map_err(|e| format!("Failed to serialize: {}", e))?;
+    fs::write(&metadata_path, json)
+        .map_err(|e| format!("Failed to write metadata: {}", e))?;
+
+    println!("[Folders] ✓ Moved file {} to folder {:?}", file_id, folder_id);
+    Ok(())
+}
+
+/// List files in a specific folder (or root if folder_id is None)
+#[tauri::command]
+pub async fn list_files_in_folder(folder_id: Option<String>) -> Result<Vec<ChunkedFile>, String> {
+    let all_files = list_chunked_files().await?;
+    let filtered: Vec<ChunkedFile> = all_files
+        .into_iter()
+        .filter(|f| f.folder_id == folder_id)
+        .collect();
+    Ok(filtered)
+}

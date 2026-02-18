@@ -1,0 +1,1374 @@
+// P2P networking module using libp2p
+// Provides peer discovery, connection, and chunk transfer capabilities
+
+use futures::StreamExt;
+use libp2p::{
+    identify, mdns, noise, relay,
+    multiaddr::Protocol,
+    request_response::{self, Codec, ProtocolSupport},
+    swarm::{NetworkBehaviour, SwarmEvent},
+    tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm,
+};
+use once_cell::sync::OnceCell;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::io;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
+use futures::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+// use blake2::{Blake2s256, Digest};
+use blake3;
+use tauri::{AppHandle, Emitter}; // ✅ Added Tauri imports  // ✅ ADDED FOR HASH CALCULATION
+use std::time::Duration;
+
+// ============================================
+// PROTOCOL DEFINITIONS
+// ============================================
+
+/// Request for a chunk by its hash
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkRequest {
+    pub chunk_hash: String,
+}
+
+/// Response containing chunk data or error
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkResponse {
+    pub success: bool,
+    pub data: Option<Vec<u8>>,
+    pub error: Option<String>,
+}
+
+/// Request to store a chunk on a peer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreChunkRequest {
+    pub chunk_hash: String,
+    pub data: Vec<u8>,
+}
+
+/// Response to store chunk request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreChunkResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+/// Request to delete a file from a peer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteFileRequest {
+    pub file_id: String,
+    pub chunk_hashes: Vec<String>,
+}
+
+/// Response to delete file request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteFileResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+/// Custom codec for chunk transfer protocol
+#[derive(Debug, Clone, Default)]
+pub struct ChunkCodec;
+
+#[async_trait::async_trait]
+impl Codec for ChunkCodec {
+    type Protocol = StreamProtocol;
+    type Request = ChunkRequest;
+    type Response = ChunkResponse;
+
+    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut buf = Vec::new();
+        io.read_to_end(&mut buf).await?;
+        serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut buf = Vec::new();
+        io.read_to_end(&mut buf).await?;
+        serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    async fn write_request<T>(&mut self, _: &Self::Protocol, io: &mut T, req: Self::Request) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let data = serde_json::to_vec(&req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        io.write_all(&data).await?;
+        io.close().await?;
+        Ok(())
+    }
+
+    async fn write_response<T>(&mut self, _: &Self::Protocol, io: &mut T, res: Self::Response) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let data = serde_json::to_vec(&res).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        io.write_all(&data).await?;
+        io.close().await?;
+        Ok(())
+    }
+}
+
+/// Codec for storing chunks on peers
+#[derive(Debug, Clone, Default)]
+pub struct StoreChunkCodec;
+
+#[async_trait::async_trait]
+impl Codec for StoreChunkCodec {
+    type Protocol = StreamProtocol;
+    type Request = StoreChunkRequest;
+    type Response = StoreChunkResponse;
+
+    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        // Binary framing: [4 bytes hash_len][hash_bytes][remaining = chunk data]
+        let mut len_buf = [0u8; 4];
+        io.read_exact(&mut len_buf).await?;
+        let hash_len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut hash_buf = vec![0u8; hash_len];
+        io.read_exact(&mut hash_buf).await?;
+        let chunk_hash = String::from_utf8(hash_buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let mut data = Vec::new();
+        io.read_to_end(&mut data).await?;
+
+        Ok(StoreChunkRequest { chunk_hash, data })
+    }
+
+    async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut buf = Vec::new();
+        io.read_to_end(&mut buf).await?;
+        serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    async fn write_request<T>(&mut self, _: &Self::Protocol, io: &mut T, req: Self::Request) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        // Binary framing: [4 bytes hash_len][hash_bytes][chunk data]
+        let hash_bytes = req.chunk_hash.as_bytes();
+        let hash_len = (hash_bytes.len() as u32).to_be_bytes();
+        io.write_all(&hash_len).await?;
+        io.write_all(hash_bytes).await?;
+        io.write_all(&req.data).await?;
+        io.close().await?;
+        Ok(())
+    }
+
+    async fn write_response<T>(&mut self, _: &Self::Protocol, io: &mut T, res: Self::Response) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let data = serde_json::to_vec(&res).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        io.write_all(&data).await?;
+        io.close().await?;
+        Ok(())
+    }
+}
+
+/// Codec for file deletion protocol
+#[derive(Debug, Clone, Default)]
+pub struct DeleteFileCodec;
+
+#[async_trait::async_trait]
+impl Codec for DeleteFileCodec {
+    type Protocol = StreamProtocol;
+    type Request = DeleteFileRequest;
+    type Response = DeleteFileResponse;
+
+    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut buf = Vec::new();
+        io.read_to_end(&mut buf).await?;
+        serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut buf = Vec::new();
+        io.read_to_end(&mut buf).await?;
+        serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    async fn write_request<T>(&mut self, _: &Self::Protocol, io: &mut T, req: Self::Request) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let data = serde_json::to_vec(&req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        io.write_all(&data).await?;
+        io.close().await?;
+        Ok(())
+    }
+
+    async fn write_response<T>(&mut self, _: &Self::Protocol, io: &mut T, res: Self::Response) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let data = serde_json::to_vec(&res).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        io.write_all(&data).await?;
+        io.close().await?;
+        Ok(())
+    }
+}
+
+// ============================================
+// SWARM BEHAVIOUR
+// ============================================
+
+#[derive(NetworkBehaviour)]
+#[behaviour(to_swarm = "MeshDriveBehaviourEvent")]
+pub struct MeshDriveBehaviour {
+    /// Local network peer discovery
+    mdns: mdns::tokio::Behaviour,
+    /// Peer identification
+    identify: identify::Behaviour,
+    /// Chunk request/response protocol
+    chunk_transfer: request_response::Behaviour<ChunkCodec>,
+    /// Chunk store protocol
+    chunk_store: request_response::Behaviour<StoreChunkCodec>,
+    /// File deletion protocol
+    file_delete: request_response::Behaviour<DeleteFileCodec>,
+    /// Relay client (for NAT traversal)
+    relay: relay::client::Behaviour,
+}
+
+#[derive(Debug)]
+pub enum MeshDriveBehaviourEvent {
+    Mdns(mdns::Event),
+    Identify(identify::Event),
+    ChunkTransfer(request_response::Event<ChunkRequest, ChunkResponse>),
+    ChunkStore(request_response::Event<StoreChunkRequest, StoreChunkResponse>),
+    FileDelete(request_response::Event<DeleteFileRequest, DeleteFileResponse>),
+    Relay(relay::client::Event),
+}
+
+impl From<mdns::Event> for MeshDriveBehaviourEvent {
+    fn from(event: mdns::Event) -> Self {
+        MeshDriveBehaviourEvent::Mdns(event)
+    }
+}
+
+impl From<identify::Event> for MeshDriveBehaviourEvent {
+    fn from(event: identify::Event) -> Self {
+        MeshDriveBehaviourEvent::Identify(event)
+    }
+}
+
+impl From<request_response::Event<ChunkRequest, ChunkResponse>> for MeshDriveBehaviourEvent {
+    fn from(event: request_response::Event<ChunkRequest, ChunkResponse>) -> Self {
+        MeshDriveBehaviourEvent::ChunkTransfer(event)
+    }
+}
+
+impl From<request_response::Event<StoreChunkRequest, StoreChunkResponse>> for MeshDriveBehaviourEvent {
+    fn from(event: request_response::Event<StoreChunkRequest, StoreChunkResponse>) -> Self {
+        MeshDriveBehaviourEvent::ChunkStore(event)
+    }
+}
+
+impl From<request_response::Event<DeleteFileRequest, DeleteFileResponse>> for MeshDriveBehaviourEvent {
+    fn from(event: request_response::Event<DeleteFileRequest, DeleteFileResponse>) -> Self {
+        MeshDriveBehaviourEvent::FileDelete(event)
+    }
+}
+
+impl From<relay::client::Event> for MeshDriveBehaviourEvent {
+    fn from(event: relay::client::Event) -> Self {
+        MeshDriveBehaviourEvent::Relay(event)
+    }
+}
+
+// ============================================
+// P2P NODE STATE
+// ============================================
+
+pub struct P2PNode {
+    pub peer_id: PeerId,
+    pub connected_peers: Arc<RwLock<HashSet<PeerId>>>,
+    pub discovered_peers: Arc<RwLock<HashSet<PeerId>>>,
+    pub listen_addresses: Arc<RwLock<Vec<Multiaddr>>>,
+    command_tx: mpsc::Sender<P2PCommand>,
+    chunks_dir: PathBuf,
+    app_handle: AppHandle, // ✅ Added app_handle
+}
+
+#[derive(Debug)]
+enum P2PCommand {
+    Connect(Multiaddr),
+    RequestChunk {
+        peer_id: PeerId,
+        chunk_hash: String,
+        response_tx: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    StoreChunk {
+        peer_id: PeerId,
+        chunk_hash: String,
+        data: Vec<u8>,
+        response_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    BroadcastDelete {
+        file_id: String,
+        chunk_hashes: Vec<String>,
+        response_tx: tokio::sync::oneshot::Sender<usize>, // Returns count of peers notified
+    },
+}
+
+/// Global P2P node instance
+static P2P_NODE: OnceCell<Arc<P2PNode>> = OnceCell::new();
+
+/// Get the P2P node if it has been started
+pub fn get_p2p_node() -> Option<Arc<P2PNode>> {
+    P2P_NODE.get().cloned()
+}
+
+// ============================================
+// P2P NODE IMPLEMENTATION
+// ============================================
+
+impl P2PNode {
+    /// Start the P2P node
+    pub async fn start(chunks_dir: PathBuf, app_handle: AppHandle) -> Result<Arc<Self>, String> {
+        // Get data directory for key storage
+        let data_dir = dirs::data_local_dir()
+            .ok_or_else(|| "Could not find local data directory".to_string())?
+            .join("meshdrive");
+            
+        if !data_dir.exists() {
+            std::fs::create_dir_all(&data_dir)
+                .map_err(|e| format!("Failed to create data directory: {}", e))?;
+        }
+        
+        let key_path = data_dir.join("identity.key");
+        
+        // Load or generate identity
+        let local_key = if key_path.exists() {
+            println!("[P2P] Loading identity from {:?}", key_path);
+            let bytes = std::fs::read(&key_path)
+                .map_err(|e| format!("Failed to read identity file: {}", e))?;
+            libp2p::identity::Keypair::from_protobuf_encoding(&bytes)
+                .map_err(|e| format!("Failed to decode identity: {}", e))?
+        } else {
+            println!("[P2P] Generating new identity");
+            let key = libp2p::identity::Keypair::generate_ed25519();
+            let bytes = key.to_protobuf_encoding()
+                .map_err(|e| format!("Failed to encode identity: {}", e))?;
+            std::fs::write(&key_path, bytes)
+                .map_err(|e| format!("Failed to save identity file: {}", e))?;
+            key
+        };
+
+        let local_peer_id = PeerId::from(local_key.public());
+
+        println!("[P2P] Local peer id: {}", local_peer_id);
+
+        // Create swarm with relay client support
+        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )
+            .map_err(|e| format!("Failed to create TCP transport: {}", e))?
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .map_err(|e| format!("Failed to create relay client: {}", e))?
+            .with_behaviour(|key, relay| {
+                // mDNS for local discovery
+                let mdns = mdns::tokio::Behaviour::new(
+                    mdns::Config::default(),
+                    key.public().to_peer_id(),
+                )
+                .expect("Failed to create mDNS behaviour");
+
+                // Identify protocol
+                let identify = identify::Behaviour::new(identify::Config::new(
+                    "/meshdrive/1.0.0".into(),
+                    key.public(),
+                ));
+
+                // Chunk transfer protocol
+                let chunk_transfer = request_response::Behaviour::new(
+                    [(StreamProtocol::new("/meshdrive/chunk/1.0.0"), ProtocolSupport::Full)],
+                    request_response::Config::default(),
+                );
+
+             let chunk_store = request_response::Behaviour::new(
+    [(StreamProtocol::new("/meshdrive/chunk-store/1.0.0"), ProtocolSupport::Full)],
+    request_response::Config::default()
+        .with_request_timeout(Duration::from_secs(120)),
+);
+
+
+                // File delete protocol
+                let file_delete = request_response::Behaviour::new(
+                    [(StreamProtocol::new("/meshdrive/file-delete/1.0.0"), ProtocolSupport::Full)],
+                    request_response::Config::default(),
+                );
+
+                MeshDriveBehaviour {
+                    mdns,
+                    identify,
+                    chunk_transfer,
+                    chunk_store,
+                    file_delete,
+                    relay,
+                }
+            })
+            .map_err(|e| format!("Failed to create behaviour: {}", e))?
+            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(300)))
+            .build();
+
+    // Listen on all interfaces
+    swarm
+        .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+        .map_err(|e| format!("Failed to listen: {}", e))?;
+
+        // Listen on relay addresses (for NAT traversal)
+        // Default relay address — can be overridden via MESHDRIVE_RELAY_ADDRS env var
+        let default_relay = "/ip4/10.255.105.62/tcp/4001/p2p/12D3KooWNLhVc4naKjbms7A6yZw4vpP5oYdxSNXsz3qmL5xGUYCU";
+        let relay_addrs = std::env::var("MESHDRIVE_RELAY_ADDRS").unwrap_or_else(|_| default_relay.to_string());
+        {
+            for raw in relay_addrs.split(',') {
+                let raw = raw.trim();
+                if raw.is_empty() {
+                    continue;
+                }
+                match raw.parse::<Multiaddr>() {
+                    Ok(mut addr) => {
+                        addr.push(Protocol::P2pCircuit);
+                        if let Err(e) = swarm.listen_on(addr.clone()) {
+                            println!("[P2P] Failed to listen on relay addr {}: {}", addr, e);
+                        } else {
+                            println!("[P2P] Listening on relay addr {}", addr);
+                        }
+                    }
+                    Err(e) => {
+                        println!("[P2P] Invalid relay addr {}: {}", raw, e);
+                    }
+                }
+            }
+        }
+
+        // Create command channel
+        let (command_tx, command_rx) = mpsc::channel::<P2PCommand>(32);
+
+        // Create node
+        let node = Arc::new(P2PNode {
+            peer_id: local_peer_id,
+            connected_peers: Arc::new(RwLock::new(HashSet::new())),
+            discovered_peers: Arc::new(RwLock::new(HashSet::new())),
+            listen_addresses: Arc::new(RwLock::new(Vec::new())),
+            command_tx,
+            chunks_dir,
+            app_handle, // ✅ Added
+        });
+
+        // Spawn event loop
+        let node_clone = node.clone();
+        tokio::spawn(async move {
+            Self::run_event_loop(swarm, command_rx, node_clone).await;
+        });
+
+        Ok(node)
+    }
+
+    /// Main event loop
+    async fn run_event_loop(
+        mut swarm: Swarm<MeshDriveBehaviour>,
+        mut command_rx: mpsc::Receiver<P2PCommand>,
+        node: Arc<P2PNode>,
+    ) {
+        let mut pending_chunk_requests: std::collections::HashMap<
+            request_response::OutboundRequestId,
+            tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
+        > = std::collections::HashMap::new();
+        let mut pending_store_requests: std::collections::HashMap<
+            request_response::OutboundRequestId,
+            tokio::sync::oneshot::Sender<Result<(), String>>,
+        > = std::collections::HashMap::new();
+
+        loop {
+            tokio::select! {
+                // Handle swarm events
+                event = swarm.select_next_some() => {
+                    match event {
+                        SwarmEvent::NewListenAddr { address, .. } => {
+                            println!("[P2P] Listening on {}", address);
+                            node.listen_addresses.write().await.push(address);
+                        }
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            println!("[P2P] Connected to {}", peer_id);
+                            node.connected_peers.write().await.insert(peer_id);
+                            // ✅ Emit event
+                            let _ = node.app_handle.emit("peer-connected", peer_id.to_string());
+                        }
+                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                            println!("[P2P] Disconnected from {}", peer_id);
+                            node.connected_peers.write().await.remove(&peer_id);
+                            // ✅ Emit event
+                            let _ = node.app_handle.emit("peer-disconnected", peer_id.to_string());
+                        }
+                        SwarmEvent::Behaviour(MeshDriveBehaviourEvent::Mdns(event)) => {
+                            match event {
+                                mdns::Event::Discovered(list) => {
+                                    for (peer_id, addr) in list {
+                                        println!("[P2P] mDNS discovered: {} at {}", peer_id, addr);
+                                        node.discovered_peers.write().await.insert(peer_id);
+                                        // Auto-dial discovered peers
+                                        if let Err(e) = swarm.dial(addr) {
+                                            println!("[P2P] Failed to dial {}: {}", peer_id, e);
+                                        }
+                                    }
+                                }
+                                mdns::Event::Expired(list) => {
+                                    for (peer_id, _) in list {
+                                        println!("[P2P] mDNS expired: {}", peer_id);
+                                        node.discovered_peers.write().await.remove(&peer_id);
+                                    }
+                                }
+                            }
+                        }
+                        SwarmEvent::Behaviour(MeshDriveBehaviourEvent::Identify(event)) => {
+                            if let identify::Event::Received { peer_id, info } = event {
+                                println!("[P2P] Identified peer {}: {:?}", peer_id, info.protocol_version);
+                            }
+                        }
+                        SwarmEvent::Behaviour(MeshDriveBehaviourEvent::ChunkTransfer(event)) => {
+                            match event {
+                                request_response::Event::Message { peer, message } => {
+                                    match message {
+                                        request_response::Message::Request { request, channel, .. } => {
+                                            // Handle incoming chunk request
+                                            println!("[P2P] Chunk request from {}: {}", peer, request.chunk_hash);
+                                            let response = Self::handle_chunk_request(&node.chunks_dir, &request).await;
+                                            if let Err(e) = swarm.behaviour_mut().chunk_transfer.send_response(channel, response) {
+                                                println!("[P2P] Failed to send response: {:?}", e);
+                                            }
+                                        }
+                                        request_response::Message::Response { request_id, response } => {
+                                            // Handle response to our request
+                                            if let Some(tx) = pending_chunk_requests.remove(&request_id) {
+                                                let result = if response.success {
+                                                    response.data.ok_or_else(|| "No data in response".to_string())
+                                                } else {
+                                                    Err(response.error.unwrap_or_else(|| "Unknown error".to_string()))
+                                                };
+                                                let _ = tx.send(result);
+                                            }
+                                        }
+                                    }
+                                }
+                                request_response::Event::OutboundFailure { request_id, error, .. } => {
+                                    if let Some(tx) = pending_chunk_requests.remove(&request_id) {
+                                        let _ = tx.send(Err(format!("Request failed: {:?}", error)));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        SwarmEvent::Behaviour(MeshDriveBehaviourEvent::ChunkStore(event)) => {
+                            match event {
+                                request_response::Event::Message { peer, message } => {
+                                    match message {
+                                        request_response::Message::Request { request, channel, .. } => {
+                                            println!("[P2P] Store chunk request from {}: {}", peer, request.chunk_hash);
+                                            let response = Self::handle_store_chunk_request(&node.chunks_dir, &request).await;
+                                            if let Err(e) = swarm.behaviour_mut().chunk_store.send_response(channel, response) {
+                                                println!("[P2P] Failed to send store response: {:?}", e);
+                                            }
+                                        }
+                                        request_response::Message::Response { request_id, response } => {
+                                            if let Some(tx) = pending_store_requests.remove(&request_id) {
+                                                let result = if response.success {
+                                                    Ok(())
+                                                } else {
+                                                    Err(response.error.unwrap_or_else(|| "Unknown error".to_string()))
+                                                };
+                                                let _ = tx.send(result);
+                                            }
+                                        }
+                                    }
+                                }
+                                request_response::Event::OutboundFailure { request_id, error, .. } => {
+                                    if let Some(tx) = pending_store_requests.remove(&request_id) {
+                                        let _ = tx.send(Err(format!("Store request failed: {:?}", error)));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        SwarmEvent::Behaviour(MeshDriveBehaviourEvent::FileDelete(event)) => {
+                            match event {
+                                request_response::Event::Message { peer, message } => {
+                                    match message {
+                                        request_response::Message::Request { request, channel, .. } => {
+                                            println!("[P2P] Delete file request from {}: {}", peer, request.file_id);
+                                            
+                                            let file_id = request.file_id.clone();
+                                            let chunk_hashes = request.chunk_hashes.clone();
+                                            let file_id_bg = file_id.clone();
+                                            let app_handle = node.app_handle.clone();
+                                            let _chunks_dir = node.chunks_dir.clone();
+                                            
+                                            // Spawn a task to perform deletion to avoid blocking swarm
+                                            tokio::spawn(async move {
+                                                println!("[P2P] Processing remote delete request for {}", file_id_bg);
+                                                
+                                                if !chunk_hashes.is_empty() {
+                                                    println!("[P2P] Deleting {} chunks for file {}", chunk_hashes.len(), file_id_bg);
+                                                    for hash in &chunk_hashes {
+                                                        // O(1) lookup via chunk index
+                                                        if let Some(chunk_path) = crate::chunking::get_chunk_path_by_hash(hash).await {
+                                                            if let Err(e) = tokio::fs::remove_file(&chunk_path).await {
+                                                                println!("[P2P] Failed to delete chunk {}: {}", hash, e);
+                                                            } else {
+                                                                println!("[P2P] ✓ Deleted chunk {} at {:?}", hash, chunk_path);
+                                                            }
+                                                            crate::chunking::remove_chunk_index(hash).await;
+                                                        } else {
+                                                            println!("[P2P] Chunk {} not found in index, ignoring", hash);
+                                                        }
+                                                    }
+                                                } else {
+                                                    println!("[P2P] No hashes provided, attempting legacy deletion");
+let res = crate::chunking::delete_local_chunks_only(file_id_bg.clone()).await;
+if let Err(e) = res {
+                                                        println!("[P2P] Remote deletion failed: {}", e);
+                                                    }
+                                                }
+                                                
+                                                println!("[P2P] Remote deletion successful");
+                                                let _ = app_handle.emit("file-deleted-remotely", file_id_bg);
+                                            });
+                                            
+                                            // Send immediate success response (optimistic)
+                                            let response = DeleteFileResponse { success: true, error: None };
+                                            if let Err(e) = swarm.behaviour_mut().file_delete.send_response(channel, response) {
+                                                println!("[P2P] Failed to send delete response: {:?}", e);
+                                            }
+                                        }
+                                        request_response::Message::Response { request_id, response } => {
+                                             println!("[P2P] Received delete response: {:?}", response);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        SwarmEvent::Behaviour(MeshDriveBehaviourEvent::Relay(event)) => {
+                            println!("[P2P] Relay event: {:?}", event);
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Handle commands from Tauri
+                Some(command) = command_rx.recv() => {
+                    match command {
+                        P2PCommand::Connect(addr) => {
+                            if let Err(e) = swarm.dial(addr.clone()) {
+                                println!("[P2P] Failed to dial {}: {}", addr, e);
+                            }
+                        }
+                        P2PCommand::RequestChunk { peer_id, chunk_hash, response_tx } => {
+                            let request_id = swarm.behaviour_mut().chunk_transfer.send_request(
+                                &peer_id,
+                                ChunkRequest { chunk_hash },
+                            );
+                            pending_chunk_requests.insert(request_id, response_tx);
+                        }
+                        P2PCommand::StoreChunk { peer_id, chunk_hash, data, response_tx } => {
+                            let request_id = swarm.behaviour_mut().chunk_store.send_request(
+                                &peer_id,
+                                StoreChunkRequest { chunk_hash, data },
+                            );
+                            pending_store_requests.insert(request_id, response_tx);
+                        }
+                        P2PCommand::BroadcastDelete { file_id, chunk_hashes, response_tx } => {
+                            let peers: Vec<PeerId> = node.connected_peers.read().await.iter().cloned().collect();
+                            let count = peers.len();
+                            for peer_id in peers {
+                                println!("[P2P] Sending delete request to {}", peer_id);
+                                swarm.behaviour_mut().file_delete.send_request(
+                                    &peer_id,
+                                    DeleteFileRequest { 
+                                        file_id: file_id.clone(),
+                                        chunk_hashes: chunk_hashes.clone()
+                                    }
+                                );
+                            }
+                            let _ = response_tx.send(count);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ✅ OPTIMIZED: Use chunk index for O(1) lookup
+    /// Handle incoming chunk request - uses in-memory chunk index
+    async fn handle_chunk_request(_chunks_dir: &PathBuf, request: &ChunkRequest) -> ChunkResponse {
+        println!("[P2P] 🔍 Searching for chunk: {}", request.chunk_hash);
+        
+        // O(1) lookup via chunk index
+        match crate::chunking::get_chunk_path_by_hash(&request.chunk_hash).await {
+            Some(chunk_path) => {
+                println!("[P2P] ✓ Found chunk at: {:?}", chunk_path);
+                match tokio::fs::read(&chunk_path).await {
+                    Ok(data) => {
+                        println!("[P2P] ✓ Serving {} bytes", data.len());
+                        ChunkResponse {
+                            success: true,
+                            data: Some(data),
+                            error: None,
+                        }
+                    }
+                    Err(e) => {
+                        println!("[P2P] ✗ Failed to read chunk: {}", e);
+                        ChunkResponse {
+                            success: false,
+                            data: None,
+                            error: Some(format!("Failed to read chunk: {}", e)),
+                        }
+                    }
+                }
+            }
+            None => {
+                println!("[P2P] ✗ Chunk not found in index: {}", request.chunk_hash);
+                ChunkResponse {
+                    success: false,
+                    data: None,
+                    error: Some(format!("Chunk not found: {}", request.chunk_hash)),
+                }
+            }
+        }
+    }
+
+    /// Handle incoming store chunk request - validates hash and saves
+    async fn handle_store_chunk_request(chunks_dir: &PathBuf, request: &StoreChunkRequest) -> StoreChunkResponse {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&request.data);
+        let computed = hasher.finalize().to_hex().to_string();
+
+        if computed != request.chunk_hash {
+            return StoreChunkResponse {
+                success: false,
+                error: Some("Chunk hash mismatch".to_string()),
+            };
+        }
+
+        let chunk_path = chunks_dir.join(format!("{}.chunk", request.chunk_hash));
+        match tokio::fs::write(&chunk_path, &request.data).await {
+            Ok(_) => {
+                // Insert into chunk index after successful save
+                crate::chunking::insert_chunk_index(request.chunk_hash.clone(), chunk_path).await;
+                StoreChunkResponse {
+                    success: true,
+                    error: None,
+                }
+            },
+            Err(e) => StoreChunkResponse {
+                success: false,
+                error: Some(format!("Failed to save chunk: {}", e)),
+            },
+        }
+    }
+
+    /// Connect to a peer
+    pub async fn connect(&self, addr: Multiaddr) -> Result<(), String> {
+        self.command_tx
+            .send(P2PCommand::Connect(addr))
+            .await
+            .map_err(|_| "Failed to send connect command".to_string())
+    }
+
+    /// Request a chunk from a peer
+    pub async fn request_chunk(&self, peer_id: PeerId, chunk_hash: String) -> Result<Vec<u8>, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.command_tx
+            .send(P2PCommand::RequestChunk {
+                peer_id,
+                chunk_hash,
+                response_tx: tx,
+            })
+            .await
+            .map_err(|_| "Failed to send request command".to_string())?;
+
+        rx.await.map_err(|_| "Request cancelled".to_string())?
+    }
+
+    /// Store a chunk on a peer
+    pub async fn store_chunk(&self, peer_id: PeerId, chunk_hash: String, data: Vec<u8>) -> Result<(), String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.command_tx
+            .send(P2PCommand::StoreChunk {
+                peer_id,
+                chunk_hash,
+                data,
+                response_tx: tx,
+            })
+            .await
+            .map_err(|_| "Failed to send store command".to_string())?;
+
+        rx.await
+            .map_err(|_| "Store request cancelled".to_string())?
+            .map(|_| ())
+    }
+
+    /// List connected peers
+    pub async fn list_connected_peers(&self) -> Vec<String> {
+        self.connected_peers
+            .read()
+            .await
+            .iter()
+            .map(|p| p.to_string())
+            .collect()
+    }
+
+    /// List discovered peers
+    pub async fn list_discovered_peers(&self) -> Vec<String> {
+        self.discovered_peers
+            .read()
+            .await
+            .iter()
+            .map(|p| p.to_string())
+            .collect()
+    }
+
+    /// Broadcast file deletion to all connected peers
+    pub async fn broadcast_delete(&self, file_id: String, chunk_hashes: Vec<String>) -> usize {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Err(_) = self.command_tx.send(P2PCommand::BroadcastDelete {
+            file_id,
+            chunk_hashes,
+            response_tx: tx
+        }).await {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+}
+
+// ============================================
+// HELPERS
+// ============================================
+
+/// Pick the best advertise address from listen addresses.
+/// Prefer relay/circuit addresses, then non-loopback IPs.
+fn get_best_advertise_addr(listen_addrs: &[Multiaddr]) -> Option<Multiaddr> {
+    // Prefer relay/circuit address if present
+    for addr in listen_addrs {
+        if addr.to_string().contains("p2p-circuit") {
+            return Some(addr.clone());
+        }
+    }
+
+    // Prefer non-loopback, non-unspecified IP
+    for addr in listen_addrs {
+        let addr_str = addr.to_string();
+        if addr_str.contains("127.0.0.1") || addr_str.contains("::1") {
+            continue;
+        }
+        if addr_str.contains("/ip4/0.0.0.0") || addr_str.contains("/ip6/::") {
+            continue;
+        }
+        return Some(addr.clone());
+    }
+
+    // Fallback to first address
+    listen_addrs.first().cloned()
+}
+
+/// Extract IP and port from a multiaddr (if possible).
+fn extract_ip_port(addr: &Multiaddr) -> (Option<String>, Option<i32>) {
+    let addr_str = addr.to_string();
+    let parts: Vec<&str> = addr_str.split('/').collect();
+    let ip = parts
+        .iter()
+        .position(|&p| p == "ip4" || p == "ip6")
+        .and_then(|i| parts.get(i + 1))
+        .map(|s| s.to_string());
+    let port = parts
+        .iter()
+        .position(|&p| p == "tcp" || p == "udp")
+        .and_then(|i| parts.get(i + 1))
+        .and_then(|s| s.parse::<i32>().ok());
+    (ip, port)
+}
+
+/// Extract the best (non-loopback) IP and port from listen addresses.
+/// Falls back to local_ip_address::local_ip() if only loopback/unspecified is available.
+fn get_best_listen_addr(listen_addrs: &[Multiaddr]) -> (Option<String>, Option<i32>) {
+    if let Some(addr) = get_best_advertise_addr(listen_addrs) {
+        let (mut ip, port) = extract_ip_port(&addr);
+        if matches!(ip.as_deref(), Some("0.0.0.0") | Some("::")) {
+            ip = None;
+        }
+        if ip.is_none() {
+            if let Ok(lan_ip) = local_ip_address::local_ip() {
+                println!("[P2P] Detected LAN IP: {}", lan_ip);
+                ip = Some(lan_ip.to_string());
+            }
+        }
+        return (ip, port);
+    }
+    (None, None)
+}
+
+/// Strip CIDR suffix (e.g. "/32") from an IP address string
+fn strip_cidr(ip: &str) -> &str {
+    ip.split('/').next().unwrap_or(ip)
+}
+
+// ============================================
+// TAURI COMMANDS
+// ============================================
+
+use crate::api_client::{ApiClient, PeerInfo};
+use crate::auth::load_auth_state;
+
+/// Start the P2P node and auto-register with backend
+#[tauri::command]
+pub async fn p2p_start(app_handle: AppHandle) -> Result<String, String> {
+    if let Some(node) = P2P_NODE.get() {
+        return Ok(node.peer_id.to_string());
+    }
+
+    // Get chunks directory
+    let data_dir = dirs::data_local_dir()
+        .ok_or_else(|| "Could not find local data directory".to_string())?;
+    let chunks_dir = data_dir.join("meshdrive").join("chunks");
+
+    // Create chunks dir if it doesn't exist
+    if !chunks_dir.exists() {
+        std::fs::create_dir_all(&chunks_dir)
+            .map_err(|e| format!("Failed to create chunks directory: {}", e))?;
+    }
+
+    let node = P2PNode::start(chunks_dir.clone(), app_handle).await?;
+    let peer_id = node.peer_id.to_string();
+
+    // Initialize chunk index at startup (one-time scan)
+    crate::chunking::init_chunk_index(&chunks_dir).await;
+
+    P2P_NODE
+        .set(node.clone())
+        .map_err(|_| "P2P node already initialized".to_string())?;
+
+    // Auto-register with backend (in background, don't block startup)
+    tokio::spawn(async {
+        // Wait a moment for listen addresses to be discovered
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        
+        // Try to register with backend if user is logged in
+        if let Ok(auth) = load_auth_state() {
+            let node = match P2P_NODE.get() {
+                Some(n) => n,
+                None => return,
+            };
+            
+            let listen_addr = node.listen_addresses.read().await;
+            // Pick best advertise address + IP/port
+            let best_addr = get_best_advertise_addr(&listen_addr);
+            let (ip_address, port) = get_best_listen_addr(&listen_addr);
+            let peer_address = best_addr.as_ref().map(|a| a.to_string());
+            println!("[P2P] Registering with IP: {:?}, Port: {:?}, Addr: {:?}", ip_address, port, peer_address);
+
+            let api_client = ApiClient::new();
+            let device_name = hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok());
+
+            match api_client.register_peer(
+                &auth.token,
+                &node.peer_id.to_string(),
+                ip_address.as_deref(),
+                port,
+                peer_address.as_deref(),
+                device_name.as_deref(),
+            ).await {
+                Ok(info) => println!("[P2P] Registered with backend: {:?}", info.peer_id),
+                Err(e) => println!("[P2P] Failed to register with backend: {}", e),
+            }
+
+            // Start heartbeat loop
+            let peer_id = node.peer_id.to_string();
+            
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                    
+                    // Reload auth token to ensure it's fresh
+                    let token = match load_auth_state() {
+                        Ok(a) => a.token,
+                        Err(_) => {
+                            // User might be logged out, skip heartbeat but keep loop running in case they log back in
+                            continue;
+                        }
+                    };
+                    
+                    let api = ApiClient::new();
+                    if let Err(e) = api.peer_heartbeat(&token, &peer_id).await {
+                        println!("[P2P] Heartbeat failed: {}", e);
+                    }
+                }
+            });
+        } else {
+            println!("[P2P] User not logged in, skipping backend registration");
+        }
+    });
+
+    // ✅ ADDED: Auto-connect to backend peers periodically
+    tokio::spawn(async {
+        // Wait a bit for initial setup
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        
+        loop {
+            // Check for new peers every 60 seconds
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            
+            // Get node reference
+            let node = match P2P_NODE.get() {
+                Some(n) => n,
+                None => continue,
+            };
+            
+            if let Ok(auth) = load_auth_state() {
+                let api = ApiClient::new();
+                if let Ok(peers) = api.get_online_peers(&auth.token).await {
+                    let my_id = node.peer_id.to_string();
+                    
+                    println!("[P2P] Auto-discovery: Found {} backend peers", peers.len());
+                    
+                    for peer_info in peers {
+                        // Skip self
+                        if peer_info.peer_id == my_id {
+                            continue;
+                        }
+                        
+                        // Check if we need to connect
+                        if let Ok(peer_id) = peer_info.peer_id.parse::<PeerId>() {
+                            let connected = node.connected_peers.read().await;
+                            
+                            if !connected.contains(&peer_id) {
+                                // Not connected, try to connect
+                                if let Some(peer_address) = &peer_info.peer_address {
+                                    if let Ok(addr) = peer_address.parse::<Multiaddr>() {
+                                        println!("[P2P] Auto-connecting (peer_address) to {}", peer_info.peer_id);
+                                        let _ = node.connect(addr).await;
+                                    }
+                                } else if let (Some(ip_raw), Some(port)) = (&peer_info.ip_address, peer_info.port) {
+                                    let ip = strip_cidr(ip_raw);
+                                    let addr_str = format!("/ip4/{}/tcp/{}/p2p/{}", ip, port, peer_info.peer_id);
+                                    if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+                                        println!("[P2P] Auto-connecting to {}", peer_info.peer_id);
+                                        let _ = node.connect(addr).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(peer_id)
+}
+
+/// Get local peer ID
+#[tauri::command]
+pub async fn p2p_get_peer_id() -> Result<String, String> {
+    let node = P2P_NODE.get().ok_or_else(|| "P2P node not started".to_string())?;
+    Ok(node.peer_id.to_string())
+}
+
+/// Connect to a peer by multiaddr
+#[tauri::command]
+pub async fn p2p_connect(multiaddr: String) -> Result<(), String> {
+    let node = P2P_NODE.get().ok_or_else(|| "P2P node not started".to_string())?;
+    let addr: Multiaddr = multiaddr.parse().map_err(|e| format!("Invalid multiaddr: {}", e))?;
+    node.connect(addr).await
+}
+
+/// Request a chunk from a peer
+#[tauri::command]
+pub async fn p2p_request_chunk(peer_id: String, chunk_hash: String) -> Result<Vec<u8>, String> {
+    let node = P2P_NODE.get().ok_or_else(|| "P2P node not started".to_string())?;
+    let peer: PeerId = peer_id.parse().map_err(|e| format!("Invalid peer ID: {}", e))?;
+    node.request_chunk(peer, chunk_hash).await
+}
+
+/// List connected peers
+#[tauri::command]
+pub async fn p2p_list_connected_peers() -> Result<Vec<String>, String> {
+    let node = P2P_NODE.get().ok_or_else(|| "P2P node not started".to_string())?;
+    Ok(node.list_connected_peers().await)
+}
+
+/// List discovered peers (via mDNS)
+#[tauri::command]
+pub async fn p2p_list_discovered_peers() -> Result<Vec<String>, String> {
+    let node = P2P_NODE.get().ok_or_else(|| "P2P node not started".to_string())?;
+    Ok(node.list_discovered_peers().await)
+}
+
+/// Get P2P node status
+#[tauri::command]
+pub async fn p2p_status() -> Result<P2PStatus, String> {
+    match P2P_NODE.get() {
+        Some(node) => Ok(P2PStatus {
+            running: true,
+            peer_id: Some(node.peer_id.to_string()),
+            connected_count: node.connected_peers.read().await.len(),
+            discovered_count: node.discovered_peers.read().await.len(),
+        }),
+        None => Ok(P2PStatus {
+            running: false,
+            peer_id: None,
+            connected_count: 0,
+            discovered_count: 0,
+        }),
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct P2PStatus {
+    pub running: bool,
+    pub peer_id: Option<String>,
+    pub connected_count: usize,
+    pub discovered_count: usize,
+}
+
+// ============================================
+// BACKEND INTEGRATION COMMANDS
+// ============================================
+
+/// Reset P2P identity by deleting the key file
+#[tauri::command]
+pub async fn p2p_reset_identity() -> Result<(), String> {
+    let data_dir = dirs::data_local_dir()
+        .ok_or_else(|| "Could not find local data directory".to_string())?
+        .join("meshdrive");
+    let key_path = data_dir.join("identity.key");
+
+    if key_path.exists() {
+        std::fs::remove_file(&key_path)
+            .map_err(|e| format!("Failed to delete identity file: {}", e))?;
+        println!("[P2P] Identity file deleted. Restart the app to generate a new one.");
+    }
+    Ok(())
+}
+
+/// Get debug state information
+#[tauri::command]
+pub async fn p2p_debug_state() -> Result<String, String> {
+    let mut output = String::new();
+    
+    // 1. Local Node Info
+    if let Some(node) = P2P_NODE.get() {
+        output.push_str(&format!("Local Peer ID: {}\n", node.peer_id));
+        let listeners = node.listen_addresses.read().await;
+        output.push_str(&format!("Listen Addrs: {:?}\n", listeners));
+        
+        // Connected peers
+        let connected = node.connected_peers.read().await;
+        output.push_str(&format!("Connected Peers ({}): {:?}\n", connected.len(), 
+            connected.iter().map(|p| p.to_string()).collect::<Vec<_>>()));
+    } else {
+        output.push_str("Local Node: Not Started\n");
+    }
+    
+    // 2. Auth Info
+    match load_auth_state() {
+        Ok(auth) => {
+            output.push_str(&format!("Auth: Logged In (Token len: {})\n", auth.token.len()));
+            output.push_str(&format!("User ID: {}\n", auth.user_id));
+            
+            // 3. Backend Peers
+            let api = ApiClient::new();
+            match api.get_online_peers(&auth.token).await {
+                Ok(peers) => {
+                    output.push_str(&format!("Backend Online Peers ({}):\n", peers.len()));
+                    for p in peers {
+                        output.push_str(&format!("  - ID: {}, Name: {:?}, IP: {:?}, Port: {:?}\n", 
+                            p.peer_id, p.device_name, p.ip_address, p.port));
+                    }
+                }
+                Err(e) => output.push_str(&format!("Backend Error: {}\n", e)),
+            }
+        }
+        Err(e) => output.push_str(&format!("Auth: Error ({})\n", e)),
+    }
+    
+    Ok(output)
+}
+
+/// Register local peer with backend server
+#[tauri::command]
+pub async fn p2p_register_with_backend() -> Result<PeerInfo, String> {
+    let node = P2P_NODE.get().ok_or_else(|| "P2P node not started".to_string())?;
+    let auth = load_auth_state()?;
+    
+    // Get listen addresses and pick best advertise address + IP
+    let listen_addr = node.listen_addresses.read().await;
+    let best_addr = get_best_advertise_addr(&listen_addr);
+    let (ip_address, port) = get_best_listen_addr(&listen_addr);
+    let peer_address = best_addr.as_ref().map(|a| a.to_string());
+
+    let api_client = ApiClient::new();
+    let device_name = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok());
+
+    api_client.register_peer(
+        &auth.token,
+        &node.peer_id.to_string(),
+        ip_address.as_deref(),
+        port,
+        peer_address.as_deref(),
+        device_name.as_deref(),
+    ).await
+}
+
+/// Get online peers from backend and optionally connect to them
+#[tauri::command]
+pub async fn p2p_discover_from_backend() -> Result<Vec<PeerInfo>, String> {
+    let auth = load_auth_state()?;
+    let api_client = ApiClient::new();
+    
+    api_client.get_online_peers(&auth.token).await
+}
+
+/// Connect to a peer from backend peer info
+#[tauri::command]
+pub async fn p2p_connect_to_backend_peer(peer_address: String) -> Result<(), String> {
+    let node = P2P_NODE.get().ok_or_else(|| "P2P node not started".to_string())?;
+    let addr: Multiaddr = peer_address.parse().map_err(|e| format!("Invalid multiaddr: {}", e))?;
+    node.connect(addr).await
+}
+
+/// Send heartbeat to backend to keep peer online
+#[tauri::command]
+pub async fn p2p_heartbeat() -> Result<(), String> {
+    let node = P2P_NODE.get().ok_or_else(|| "P2P node not started".to_string())?;
+    let auth = load_auth_state()?;
+    let api_client = ApiClient::new();
+    
+    api_client.peer_heartbeat(&auth.token, &node.peer_id.to_string()).await
+}
+
+/// Set peer offline on backend (call when app closes)
+#[tauri::command]
+pub async fn p2p_set_offline() -> Result<(), String> {
+    let node = P2P_NODE.get().ok_or_else(|| "P2P node not started".to_string())?;
+    let auth = load_auth_state()?;
+    let api_client = ApiClient::new();
+    
+    api_client.set_peer_online(&auth.token, &node.peer_id.to_string(), false).await
+}
+
+// ✅ ADDED: Force connect to all backend peers
+/// Force connect to all backend peers (for debugging/manual triggering)
+#[tauri::command]
+pub async fn p2p_connect_all_backend_peers() -> Result<String, String> {
+    let node = P2P_NODE.get().ok_or_else(|| "P2P node not started".to_string())?;
+    let auth = load_auth_state()?;
+    let api_client = ApiClient::new();
+    
+    let backend_peers = api_client.get_online_peers(&auth.token).await?;
+    let my_peer_id = node.peer_id.to_string();
+    
+    let mut connected = 0;
+    let mut failed = 0;
+    let mut skipped = 0;
+    
+    println!("[P2P] Attempting to connect to {} backend peers...", backend_peers.len());
+    
+    for peer_info in backend_peers {
+        // Skip self
+        if peer_info.peer_id == my_peer_id {
+            println!("[P2P] Skipping self: {}", peer_info.peer_id);
+            skipped += 1;
+            continue;
+        }
+        
+        if let Some(peer_address) = &peer_info.peer_address {
+            match peer_address.parse::<Multiaddr>() {
+                Ok(addr) => {
+                    println!("[P2P] Connecting (peer_address) to {} at {}", peer_info.peer_id, addr);
+                    match node.connect(addr).await {
+                        Ok(_) => {
+                            println!("[P2P] ✓ Connection initiated to {}", peer_info.peer_id);
+                            connected += 1;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        }
+                        Err(e) => {
+                            println!("[P2P] ✗ Failed to connect to {}: {}", peer_info.peer_id, e);
+                            failed += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[P2P] ✗ Invalid multiaddr: {} - {}", peer_address, e);
+                    failed += 1;
+                }
+            }
+        } else if let (Some(ip), Some(port)) = (&peer_info.ip_address, peer_info.port) {
+            let addr_str = format!("/ip4/{}/tcp/{}/p2p/{}", ip, port, peer_info.peer_id);
+            
+            match addr_str.parse::<Multiaddr>() {
+                Ok(addr) => {
+                    println!("[P2P] Connecting to {} at {}", peer_info.peer_id, addr);
+                    match node.connect(addr).await {
+                        Ok(_) => {
+                            println!("[P2P] ✓ Connection initiated to {}", peer_info.peer_id);
+                            connected += 1;
+                            // Give it a moment to establish
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        }
+                        Err(e) => {
+                            println!("[P2P] ✗ Failed to connect to {}: {}", peer_info.peer_id, e);
+                            failed += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[P2P] ✗ Invalid multiaddr: {} - {}", addr_str, e);
+                    failed += 1;
+                }
+            }
+        } else {
+            println!("[P2P] ✗ Peer {} has no address info (ip: {:?}, port: {:?})", 
+                peer_info.peer_id, peer_info.ip_address, peer_info.port);
+            failed += 1;
+        }
+    }
+    
+    let result = format!(
+        "Connected: {}, Failed: {}, Skipped: {} (self)",
+        connected, failed, skipped
+    );
+    println!("[P2P] Connection summary: {}", result);
+    
+    Ok(result)
+}
